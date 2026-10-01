@@ -72,6 +72,12 @@ func NewAnthropicToGCPVertexAITranslator(modelNameOverride internalapi.ModelName
 // signature of a thinking block is restored onto the next text or tool_use part, and a trailing one onto
 // the last part; a "gemini:" signature with an empty payload is treated as no signature.
 // See https://cloud.google.com/vertex-ai/generative-ai/docs/thought-signatures.
+//
+// Request fields without a Gemini counterpart are ignored: metadata, service_tier, cache_control,
+// tool_choice.disable_parallel_tool_use, container, mcp_servers, context_management and safeguards.
+// Server and client built-in tools are skipped (see anthropicToolsToGemini), max_tokens is passed through
+// unclamped, the MIME type of an image URL is guessed from its extension (JPEG by default) and a document
+// URL is assumed to be a PDF. The count_tokens endpoint is not supported.
 type anthropicToGCPVertexAITranslator struct {
 	modelNameOverride internalapi.ModelNameOverride
 	requestModel      internalapi.RequestModel
@@ -90,8 +96,11 @@ func (a *anthropicToGCPVertexAITranslator) RequestBody(raw []byte, body *anthrop
 	a.requestModel = cmp.Or(a.modelNameOverride, body.Model)
 
 	// output_config is not part of anthropic.MessagesRequest, so it is read from the raw body.
-	effort := gjson.GetBytes(raw, "output_config.effort").Str
-	gcpReq, err := anthropicToGeminiRequest(body, a.requestModel, effort, a.logger)
+	outputConfig, err := parseAnthropicOutputConfig(raw)
+	if err != nil {
+		return nil, nil, err
+	}
+	gcpReq, err := anthropicToGeminiRequest(body, a.requestModel, outputConfig, a.logger)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -255,16 +264,56 @@ func (a *anthropicToGCPVertexAITranslator) RedactAnthropicBody(resp *anthropic.M
 // Request conversion: Anthropic Messages -> Gemini
 // -------------------------------------------------------------
 
+// anthropicOutputConfig is the output_config of a Messages request, which anthropic.MessagesRequest does
+// not carry. jsonSchema is the schema of a json_schema format and nil when no format is requested.
+type anthropicOutputConfig struct {
+	effort     string
+	jsonSchema map[string]any
+}
+
+// parseAnthropicOutputConfig reads output_config from the raw request body. json_schema is the only format
+// defined by the Anthropic API; any other format type is rejected rather than silently ignored, since the
+// client would otherwise receive plain text where it expects JSON.
+func parseAnthropicOutputConfig(raw []byte) (anthropicOutputConfig, error) {
+	oc := anthropicOutputConfig{effort: gjson.GetBytes(raw, "output_config.effort").Str}
+	format := gjson.GetBytes(raw, "output_config.format")
+	if !format.Exists() || format.Type == gjson.Null {
+		return oc, nil
+	}
+	if !format.IsObject() {
+		return oc, fmt.Errorf("%w: output_config.format must be an object", internalapi.ErrInvalidRequestBody)
+	}
+	if typ := format.Get("type").Str; typ != "json_schema" {
+		return oc, fmt.Errorf("%w: unsupported output_config.format.type %q (supported: json_schema)", internalapi.ErrInvalidRequestBody, typ)
+	}
+	schema := format.Get("schema")
+	if !schema.IsObject() {
+		return oc, fmt.Errorf("%w: output_config.format.schema must be a JSON object", internalapi.ErrInvalidRequestBody)
+	}
+	if err := json.Unmarshal([]byte(schema.Raw), &oc.jsonSchema); err != nil {
+		return oc, fmt.Errorf("%w: invalid output_config.format.schema: %w", internalapi.ErrInvalidRequestBody, err)
+	}
+	return oc, nil
+}
+
 func anthropicToGeminiRequest(
-	body *anthropic.MessagesRequest, model internalapi.RequestModel, effort string, logger *slog.Logger,
+	body *anthropic.MessagesRequest, model internalapi.RequestModel, outputConfig anthropicOutputConfig, logger *slog.Logger,
 ) (*gcp.GenerateContentRequest, error) {
 	// Gemini has no counterpart of assistant prefill: a request ending with a model content is rejected.
 	if n := len(body.Messages); n > 0 && body.Messages[n-1].Role == anthropic.MessageRoleAssistant {
-		return nil, fmt.Errorf("%w: assistant prefill is not supported for GCPVertexAI backends", internalapi.ErrInvalidRequestBody)
+		return nil, errAnthropicPrefill
 	}
 	contents, err := anthropicMessagesToGeminiContents(body.Messages)
 	if err != nil {
 		return nil, err
+	}
+	// Empty messages are dropped during conversion, so the checks are repeated on the result: Vertex AI
+	// rejects both an empty contents list and one ending with a model content.
+	if len(contents) == 0 {
+		return nil, fmt.Errorf("%w: messages must contain at least one non-empty message", internalapi.ErrInvalidRequestBody)
+	}
+	if contents[len(contents)-1].Role == genai.RoleModel {
+		return nil, errAnthropicPrefill
 	}
 	tools, skippedTools, err := anthropicToolsToGemini(body.Tools, responseJSONSchemaAvailable(model))
 	if err != nil {
@@ -281,11 +330,19 @@ func anthropicToGeminiRequest(
 				slog.Any("tool_types", skippedTools))
 		}
 	}
+	if tc := body.ToolChoice; tc != nil && tc.Tool != nil && !declaresFunction(tools, tc.Tool.Name) {
+		return nil, fmt.Errorf("%w: tool_choice refers to tool %q, which is not a custom tool in tools",
+			internalapi.ErrInvalidRequestBody, tc.Tool.Name)
+	}
+	generationConfig, err := anthropicToGeminiGenerationConfig(body, model, outputConfig)
+	if err != nil {
+		return nil, err
+	}
 	req := &gcp.GenerateContentRequest{
 		Contents:          contents,
 		Tools:             tools,
 		SystemInstruction: anthropicSystemToGemini(body.System),
-		GenerationConfig:  anthropicToGeminiGenerationConfig(body, model, effort),
+		GenerationConfig:  generationConfig,
 	}
 	if len(tools) > 0 {
 		req.ToolConfig = anthropicToolChoiceToGemini(body.ToolChoice)
@@ -293,19 +350,27 @@ func anthropicToGeminiRequest(
 	return req, nil
 }
 
+var errAnthropicPrefill = fmt.Errorf("%w: assistant prefill is not supported for GCPVertexAI backends", internalapi.ErrInvalidRequestBody)
+
+// declaresFunction reports whether a function with the given name is declared in tools.
+func declaresFunction(tools []genai.Tool, name string) bool {
+	for i := range tools {
+		for _, decl := range tools[i].FunctionDeclarations {
+			if decl.Name == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // anthropicMessageRoleSystem is the role of mid-conversation system messages sent by Claude Code.
 const anthropicMessageRoleSystem anthropic.MessageRole = "system"
 
 func anthropicMessagesToGeminiContents(messages []anthropic.MessageParam) ([]genai.Content, error) {
+	// toolNames maps tool_use ids to tool names as the assistant messages are converted, so that a
+	// tool_result can only refer to a tool_use that precedes it.
 	toolNames := make(map[string]string)
-	for i := range messages {
-		for j := range messages[i].Content.Array {
-			if tu := messages[i].Content.Array[j].ToolUse; tu != nil {
-				toolNames[tu.ID] = tu.Name
-			}
-		}
-	}
-
 	var contents []genai.Content
 	// nonPromptParts tracks user parts that do not start a new turn: text converted from system messages
 	// and parts split off from contents carrying function responses.
@@ -322,6 +387,11 @@ func anthropicMessagesToGeminiContents(messages []anthropic.MessageParam) ([]gen
 		case anthropic.MessageRoleAssistant:
 			role = genai.RoleModel
 			parts = anthropicAssistantContentToGeminiParts(&msg.Content)
+			for _, part := range parts {
+				if fc := part.FunctionCall; fc != nil && fc.Name != "" {
+					toolNames[fc.ID] = fc.Name
+				}
+			}
 		case anthropicMessageRoleSystem:
 			// Gemini has no mid-conversation system role, so the text is passed as user text in place.
 			role = genai.RoleUser
@@ -429,13 +499,17 @@ func anthropicUserContentToGeminiParts(content *anthropic.MessageContent, toolNa
 
 // anthropicAssistantContentToGeminiParts converts an assistant message and restores the Gemini thought
 // signatures carried by its thinking blocks. Thinking text is not sent back since the signature is what
-// preserves the reasoning context; redacted_thinking blocks and non-Gemini signatures are dropped.
+// preserves the reasoning context, except when the message holds nothing else: the thinking text is then
+// sent as a thought part so that the model turn is kept. Vertex AI rejects a thought part without text, so
+// a message whose thinking blocks are all empty (thinking.display: omitted) is dropped together with its
+// signature. redacted_thinking blocks and non-Gemini signatures are dropped.
 func anthropicAssistantContentToGeminiParts(content *anthropic.MessageContent) []*genai.Part {
 	if content.Text != "" {
 		return []*genai.Part{genai.NewPartFromText(content.Text)}
 	}
 	var parts []*genai.Part
 	var pendingSig []byte
+	var thinkingTexts []string
 	for i := range content.Array {
 		block := &content.Array[i]
 		var part *genai.Part
@@ -443,6 +517,9 @@ func anthropicAssistantContentToGeminiParts(content *anthropic.MessageContent) [
 		case block.Thinking != nil:
 			if sig := decodeGeminiThoughtSignature(block.Thinking.Signature); sig != nil {
 				pendingSig = sig
+			}
+			if block.Thinking.Thinking != "" {
+				thinkingTexts = append(thinkingTexts, block.Thinking.Thinking)
 			}
 			continue
 		case block.Text != nil:
@@ -462,8 +539,14 @@ func anthropicAssistantContentToGeminiParts(content *anthropic.MessageContent) [
 		part.ThoughtSignature, pendingSig = pendingSig, nil
 		parts = append(parts, part)
 	}
+	if len(parts) == 0 {
+		if len(thinkingTexts) == 0 {
+			return nil
+		}
+		return []*genai.Part{{Text: strings.Join(thinkingTexts, "\n"), Thought: true, ThoughtSignature: pendingSig}}
+	}
 	// Gemini parts must carry data, so a trailing signature goes onto the last part instead of an empty one.
-	if last := len(parts) - 1; pendingSig != nil && last >= 0 && len(parts[last].ThoughtSignature) == 0 {
+	if last := len(parts) - 1; pendingSig != nil && len(parts[last].ThoughtSignature) == 0 {
 		parts[last].ThoughtSignature = pendingSig
 	}
 	return parts
@@ -608,12 +691,19 @@ func anthropicBlockToGeminiPieces(
 func anthropicImageSourceToGeminiMedia(src *anthropic.ImageSource) (*geminiMedia, error) {
 	switch {
 	case src.Base64 != nil:
+		// An empty URL or data would otherwise become a 0-byte inlineData part, which Vertex AI rejects.
+		if src.Base64.MediaType == "" || src.Base64.Data == "" {
+			return nil, fmt.Errorf("%w: base64 image source requires media_type and data", internalapi.ErrInvalidRequestBody)
+		}
 		data, err := base64.StdEncoding.DecodeString(src.Base64.Data)
 		if err != nil {
 			return nil, fmt.Errorf("%w: invalid base64 image data", internalapi.ErrInvalidRequestBody)
 		}
 		return &geminiMedia{mimeType: src.Base64.MediaType, data: data}, nil
 	case src.URL != nil:
+		if src.URL.URL == "" {
+			return nil, fmt.Errorf("%w: image url must not be empty", internalapi.ErrInvalidRequestBody)
+		}
 		return &geminiMedia{mimeType: imageMIMETypeFromURL(src.URL.URL), uri: src.URL.URL}, nil
 	}
 	// The source type is not kept by the unmarshaler for unknown sources such as "file" (Files API).
@@ -635,6 +725,9 @@ func imageMIMETypeFromURL(rawURL string) string {
 func anthropicDocumentSourceToGeminiPieces(src *anthropic.DocumentSource) ([]geminiPiece, error) {
 	switch {
 	case src.Base64PDF != nil:
+		if src.Base64PDF.Data == "" {
+			return nil, fmt.Errorf("%w: base64 document source requires data", internalapi.ErrInvalidRequestBody)
+		}
 		data, err := base64.StdEncoding.DecodeString(src.Base64PDF.Data)
 		if err != nil {
 			return nil, fmt.Errorf("%w: invalid base64 document data", internalapi.ErrInvalidRequestBody)
@@ -643,6 +736,9 @@ func anthropicDocumentSourceToGeminiPieces(src *anthropic.DocumentSource) ([]gem
 	case src.PlainText != nil:
 		return []geminiPiece{{text: src.PlainText.Data}}, nil
 	case src.URL != nil:
+		if src.URL.URL == "" {
+			return nil, fmt.Errorf("%w: document url must not be empty", internalapi.ErrInvalidRequestBody)
+		}
 		return []geminiPiece{{media: &geminiMedia{mimeType: mimeTypeApplicationPDF, uri: src.URL.URL}}}, nil
 	case src.ContentBlock != nil:
 		c := &src.ContentBlock.Content
@@ -709,6 +805,9 @@ func anthropicToolsToGemini(tools []anthropic.ToolUnion, parametersJSONSchemaAva
 			skipped = append(skipped, anthropicBuiltinToolType(&tools[i]))
 			continue
 		}
+		if t.Name == "" {
+			return nil, nil, fmt.Errorf("%w: tools[%d] has no name", internalapi.ErrInvalidRequestBody, i)
+		}
 		decl := &genai.FunctionDeclaration{Name: t.Name, Description: t.Description}
 		if len(t.InputSchema) > 0 {
 			var schema map[string]any
@@ -772,10 +871,15 @@ func anthropicToolChoiceToGemini(tc *anthropic.ToolChoice) *genai.ToolConfig {
 	return &genai.ToolConfig{FunctionCallingConfig: cfg}
 }
 
-func anthropicToGeminiGenerationConfig(body *anthropic.MessagesRequest, model internalapi.RequestModel, effort string) *genai.GenerationConfig {
+// anthropicToGeminiGenerationConfig maps sampling parameters, thinking and output_config. A json_schema
+// output format is mapped the same way as the OpenAI response_format in openAIReqToGeminiGenerationConfig:
+// the JSON schema is passed as is on models accepting it and converted to the Gemini schema otherwise.
+func anthropicToGeminiGenerationConfig(
+	body *anthropic.MessagesRequest, model internalapi.RequestModel, outputConfig anthropicOutputConfig,
+) (*genai.GenerationConfig, error) {
 	gc := &genai.GenerationConfig{
 		StopSequences:  body.StopSequences,
-		ThinkingConfig: anthropicThinkingToGemini(body.Thinking, effort, model),
+		ThinkingConfig: anthropicThinkingToGemini(body.Thinking, outputConfig.effort, model),
 	}
 	if body.MaxTokens > 0 {
 		gc.MaxOutputTokens = int32(min(body.MaxTokens, math.MaxInt32))
@@ -789,7 +893,19 @@ func anthropicToGeminiGenerationConfig(body *anthropic.MessagesRequest, model in
 	if body.TopK != nil {
 		gc.TopK = ptr.To(float32(*body.TopK))
 	}
-	return gc
+	if outputConfig.jsonSchema != nil {
+		gc.ResponseMIMEType = mimeTypeApplicationJSON
+		if responseJSONSchemaAvailable(model) {
+			gc.ResponseJsonSchema = outputConfig.jsonSchema
+		} else {
+			schema, err := jsonSchemaToGemini(outputConfig.jsonSchema)
+			if err != nil {
+				return nil, fmt.Errorf("%w: invalid output_config.format.schema: %w", internalapi.ErrInvalidRequestBody, err)
+			}
+			gc.ResponseSchema = schema
+		}
+	}
+	return gc, nil
 }
 
 // anthropicThinkingToGemini maps the Anthropic thinking configuration and output_config.effort. On models

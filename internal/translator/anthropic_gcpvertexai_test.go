@@ -60,7 +60,7 @@ func parseAnthropicRequest(t *testing.T, body string) *anthropic.MessagesRequest
 
 func translateAnthropicRequest(t *testing.T, model, body string) *gcp.GenerateContentRequest {
 	t.Helper()
-	req, err := anthropicToGeminiRequest(parseAnthropicRequest(t, body), model, "", nil)
+	req, err := anthropicToGeminiRequest(parseAnthropicRequest(t, body), model, anthropicOutputConfig{}, nil)
 	require.NoError(t, err)
 	return req
 }
@@ -285,7 +285,7 @@ func TestAnthropicToGeminiRequest_Errors(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := anthropicToGeminiRequest(parseAnthropicRequest(t, tc.body), testGemini3Flash, "", nil)
+			_, err := anthropicToGeminiRequest(parseAnthropicRequest(t, tc.body), testGemini3Flash, anthropicOutputConfig{}, nil)
 			require.ErrorIs(t, err, internalapi.ErrInvalidRequestBody)
 			require.ErrorContains(t, err, tc.errMsg)
 		})
@@ -294,6 +294,321 @@ func TestAnthropicToGeminiRequest_Errors(t *testing.T) {
 	t.Run("unsupported role", func(t *testing.T) {
 		_, err := anthropicMessagesToGeminiContents([]anthropic.MessageParam{{Role: "developer", Content: anthropic.MessageContent{Text: "x"}}})
 		require.ErrorIs(t, err, internalapi.ErrInvalidRequestBody)
+	})
+}
+
+func TestAnthropicToGeminiRequest_Validation(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		body   string
+		errMsg string
+	}{
+		{
+			name:   "all messages empty",
+			body:   `{"model":"m","max_tokens":1,"messages":[{"role":"user","content":""},{"role":"user","content":[]}]}`,
+			errMsg: "messages must contain at least one non-empty message",
+		},
+		{
+			name: "trailing empty user message leaves a model turn last",
+			body: `{"model":"m","max_tokens":1,"messages":[
+				{"role":"user","content":"hi"},
+				{"role":"assistant","content":"hello"},
+				{"role":"user","content":[{"type":"text","text":""}]}
+			]}`,
+			errMsg: "assistant prefill is not supported for GCPVertexAI backends",
+		},
+		{
+			name: "trailing empty system message leaves a model turn last",
+			body: `{"model":"m","max_tokens":1,"messages":[
+				{"role":"user","content":"hi"},
+				{"role":"assistant","content":"hello"},
+				{"role":"system","content":[{"type":"image","source":{"type":"url","url":"https://example.com/a.png"}}]}
+			]}`,
+			errMsg: "assistant prefill is not supported for GCPVertexAI backends",
+		},
+		{
+			name:   "empty image url",
+			body:   `{"model":"m","max_tokens":1,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"url","url":""}}]}]}`,
+			errMsg: "image url must not be empty",
+		},
+		{
+			name:   "empty base64 image data",
+			body:   `{"model":"m","max_tokens":1,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":""}}]}]}`,
+			errMsg: "base64 image source requires media_type and data",
+		},
+		{
+			name:   "missing image media_type",
+			body:   `{"model":"m","max_tokens":1,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","data":"` + b64("x") + `"}}]}]}`,
+			errMsg: "base64 image source requires media_type and data",
+		},
+		{
+			name:   "empty document url",
+			body:   `{"model":"m","max_tokens":1,"messages":[{"role":"user","content":[{"type":"document","source":{"type":"url","url":""}}]}]}`,
+			errMsg: "document url must not be empty",
+		},
+		{
+			name:   "empty base64 document data",
+			body:   `{"model":"m","max_tokens":1,"messages":[{"role":"user","content":[{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":""}}]}]}`,
+			errMsg: "base64 document source requires data",
+		},
+		{
+			name: "empty image url inside a tool result",
+			body: `{"model":"m","max_tokens":1,"messages":[
+				{"role":"user","content":"go"},
+				{"role":"assistant","content":[{"type":"tool_use","id":"a","name":"Read","input":{}}]},
+				{"role":"user","content":[{"type":"tool_result","tool_use_id":"a","content":[{"type":"image","source":{"type":"url","url":""}}]}]}
+			]}`,
+			errMsg: "image url must not be empty",
+		},
+		{
+			name:   "custom tool without a name",
+			body:   `{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"x"}],"tools":[{"name":"Read"},{"name":"","input_schema":{"type":"object"}}]}`,
+			errMsg: "tools[1] has no name",
+		},
+		{
+			name: "tool_choice names an undeclared tool",
+			body: `{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"x"}],
+				"tools":[{"name":"Read"}],"tool_choice":{"type":"tool","name":"Write"}}`,
+			errMsg: `tool_choice refers to tool "Write", which is not a custom tool in tools`,
+		},
+		{
+			name: "tool_choice names a skipped built-in tool",
+			body: `{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"x"}],
+				"tools":[{"name":"Read"},{"type":"web_search_20250305","name":"web_search"}],"tool_choice":{"type":"tool","name":"web_search"}}`,
+			errMsg: `tool_choice refers to tool "web_search"`,
+		},
+		{
+			name: "tool_choice names a tool without any tools",
+			body: `{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"x"}],
+				"tool_choice":{"type":"tool","name":"Read"}}`,
+			errMsg: `tool_choice refers to tool "Read"`,
+		},
+		{
+			name: "tool_result before its tool_use",
+			body: `{"model":"m","max_tokens":1,"messages":[
+				{"role":"user","content":[{"type":"tool_result","tool_use_id":"a","content":"x"}]},
+				{"role":"assistant","content":[{"type":"tool_use","id":"a","name":"Read","input":{}}]},
+				{"role":"user","content":"next"}
+			]}`,
+			errMsg: `unknown tool_use_id "a"`,
+		},
+		{
+			name: "tool_result of a tool_use without a name",
+			body: `{"model":"m","max_tokens":1,"messages":[
+				{"role":"user","content":"go"},
+				{"role":"assistant","content":[{"type":"tool_use","id":"a","name":"","input":{}}]},
+				{"role":"user","content":[{"type":"tool_result","tool_use_id":"a","content":"x"}]}
+			]}`,
+			errMsg: `unknown tool_use_id "a"`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := anthropicToGeminiRequest(parseAnthropicRequest(t, tc.body), testGemini3Flash, anthropicOutputConfig{}, nil)
+			require.ErrorIs(t, err, internalapi.ErrInvalidRequestBody)
+			require.ErrorContains(t, err, tc.errMsg)
+		})
+	}
+
+	t.Run("trailing non-empty system message is a user turn", func(t *testing.T) {
+		req := translateAnthropicRequest(t, testGemini3Flash, `{"model":"m","max_tokens":1,"messages":[
+			{"role":"user","content":"hi"},
+			{"role":"assistant","content":"hello"},
+			{"role":"system","content":"# Environment"}
+		]}`)
+		require.Len(t, req.Contents, 3)
+		require.Equal(t, genai.Content{Role: genai.RoleUser, Parts: []*genai.Part{{Text: "# Environment"}}}, req.Contents[2])
+	})
+}
+
+func TestAnthropicToGeminiRequest_ThinkingOnlyAssistant(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		body     string
+		expected []genai.Content
+	}{
+		{
+			name: "thinking text with a Gemini signature is kept as a thought part",
+			body: `{"model":"m","max_tokens":1,"messages":[
+				{"role":"user","content":"a"},
+				{"role":"assistant","content":[{"type":"thinking","thinking":"let me see","signature":"` + geminiSig("sig") + `"}]},
+				{"role":"user","content":"b"}
+			]}`,
+			expected: []genai.Content{
+				{Role: genai.RoleUser, Parts: []*genai.Part{{Text: "a"}}},
+				{Role: genai.RoleModel, Parts: []*genai.Part{{Text: "let me see", Thought: true, ThoughtSignature: []byte("sig")}}},
+				{Role: genai.RoleUser, Parts: []*genai.Part{{Text: "b"}}},
+			},
+		},
+		{
+			name: "several thinking blocks are joined and a non-Gemini signature is dropped",
+			body: `{"model":"m","max_tokens":1,"messages":[
+				{"role":"user","content":"a"},
+				{"role":"assistant","content":[
+					{"type":"thinking","thinking":"first","signature":"` + b64("anthropic") + `"},
+					{"type":"redacted_thinking","data":"x"},
+					{"type":"thinking","thinking":"second","signature":"gemini:"}
+				]},
+				{"role":"user","content":"b"}
+			]}`,
+			expected: []genai.Content{
+				{Role: genai.RoleUser, Parts: []*genai.Part{{Text: "a"}}},
+				{Role: genai.RoleModel, Parts: []*genai.Part{{Text: "first\nsecond", Thought: true}}},
+				{Role: genai.RoleUser, Parts: []*genai.Part{{Text: "b"}}},
+			},
+		},
+		{
+			name: "empty thinking text (display omitted) drops the turn since Vertex AI rejects a thought part without text",
+			body: `{"model":"m","max_tokens":1,"messages":[
+				{"role":"user","content":"a"},
+				{"role":"assistant","content":[{"type":"thinking","thinking":"","signature":"` + geminiSig("sig") + `"}]},
+				{"role":"user","content":"b"}
+			]}`,
+			expected: []genai.Content{{Role: genai.RoleUser, Parts: []*genai.Part{{Text: "a"}, {Text: "b"}}}},
+		},
+		{
+			name: "thinking text next to a tool_use is still omitted",
+			body: `{"model":"m","max_tokens":1,"messages":[
+				{"role":"user","content":"a"},
+				{"role":"assistant","content":[
+					{"type":"thinking","thinking":"let me see","signature":"` + geminiSig("sig") + `"},
+					{"type":"tool_use","id":"t","name":"Read","input":{}}
+				]},
+				{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"x"}]}
+			]}`,
+			expected: []genai.Content{
+				{Role: genai.RoleUser, Parts: []*genai.Part{{Text: "a"}}},
+				{Role: genai.RoleModel, Parts: []*genai.Part{{
+					FunctionCall: &genai.FunctionCall{ID: "t", Name: "Read", Args: map[string]any{}}, ThoughtSignature: []byte("sig"),
+				}}},
+				{Role: genai.RoleUser, Parts: []*genai.Part{{FunctionResponse: &genai.FunctionResponse{ID: "t", Name: "Read", Response: map[string]any{"output": "x"}}}}},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := translateAnthropicRequest(t, testGemini3Flash, tc.body)
+			require.Equal(t, tc.expected, req.Contents)
+		})
+	}
+}
+
+func TestParseAnthropicOutputConfig(t *testing.T) {
+	schema := map[string]any{
+		"type":                 "object",
+		"properties":           map[string]any{"title": map[string]any{"type": "string"}},
+		"required":             []any{"title"},
+		"additionalProperties": false,
+	}
+	for _, tc := range []struct {
+		name     string
+		raw      string
+		expected anthropicOutputConfig
+		errMsg   string
+	}{
+		{name: "nil body", raw: "", expected: anthropicOutputConfig{}},
+		{name: "no output_config", raw: `{"model":"m"}`, expected: anthropicOutputConfig{}},
+		{name: "effort only", raw: `{"output_config":{"effort":"low"}}`, expected: anthropicOutputConfig{effort: "low"}},
+		{name: "null format", raw: `{"output_config":{"format":null}}`, expected: anthropicOutputConfig{}},
+		{
+			name:     "json_schema format with effort",
+			raw:      `{"output_config":{"effort":"high","format":{"type":"json_schema","schema":{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}}}}`,
+			expected: anthropicOutputConfig{effort: "high", jsonSchema: schema},
+		},
+		{name: "format is not an object", raw: `{"output_config":{"format":"json"}}`, errMsg: "output_config.format must be an object"},
+		{name: "unknown format type", raw: `{"output_config":{"format":{"type":"text"}}}`, errMsg: `unsupported output_config.format.type "text" (supported: json_schema)`},
+		{name: "missing schema", raw: `{"output_config":{"format":{"type":"json_schema"}}}`, errMsg: "output_config.format.schema must be a JSON object"},
+		{name: "schema is not an object", raw: `{"output_config":{"format":{"type":"json_schema","schema":[1]}}}`, errMsg: "output_config.format.schema must be a JSON object"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			oc, err := parseAnthropicOutputConfig([]byte(tc.raw))
+			if tc.errMsg != "" {
+				require.ErrorIs(t, err, internalapi.ErrInvalidRequestBody)
+				require.ErrorContains(t, err, tc.errMsg)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.expected, oc)
+		})
+	}
+}
+
+func TestAnthropicToGCPVertexAI_RequestBody_OutputFormat(t *testing.T) {
+	// Tools and a json_schema format together: Vertex AI accepts both, so neither is dropped.
+	raw := []byte(`{"model":"m","max_tokens":512,"messages":[{"role":"user","content":"summarize"}],
+		"tools":[{"name":"Read","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}],
+		"output_config":{"format":{"type":"json_schema","schema":{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}}}}`)
+	schema := map[string]any{
+		"type":                 "object",
+		"properties":           map[string]any{"title": map[string]any{"type": "string"}},
+		"required":             []any{"title"},
+		"additionalProperties": false,
+	}
+
+	t.Run("Gemini 3 passes the JSON schema as is and keeps the tools", func(t *testing.T) {
+		tr := NewAnthropicToGCPVertexAITranslator(testGemini3Flash)
+		_, body, err := tr.RequestBody(raw, parseAnthropicRequest(t, string(raw)), false)
+		require.NoError(t, err)
+		var gcpReq gcp.GenerateContentRequest
+		require.NoError(t, json.Unmarshal(body, &gcpReq))
+		require.Equal(t, &genai.GenerationConfig{
+			MaxOutputTokens:    512,
+			ResponseMIMEType:   mimeTypeApplicationJSON,
+			ResponseJsonSchema: schema,
+		}, gcpReq.GenerationConfig)
+		require.Len(t, gcpReq.Tools, 1)
+	})
+
+	t.Run("older models use the converted Gemini schema", func(t *testing.T) {
+		tr := NewAnthropicToGCPVertexAITranslator("gemini-2.0-flash")
+		_, body, err := tr.RequestBody(raw, parseAnthropicRequest(t, string(raw)), false)
+		require.NoError(t, err)
+		var gcpReq gcp.GenerateContentRequest
+		require.NoError(t, json.Unmarshal(body, &gcpReq))
+		require.Equal(t, &genai.GenerationConfig{
+			MaxOutputTokens:  512,
+			ResponseMIMEType: mimeTypeApplicationJSON,
+			ResponseSchema: &genai.Schema{
+				Type:       genai.Type("object"),
+				Properties: map[string]*genai.Schema{"title": {Type: genai.Type("string")}},
+				Required:   []string{"title"},
+			},
+		}, gcpReq.GenerationConfig)
+	})
+
+	t.Run("effort and format together", func(t *testing.T) {
+		raw := []byte(`{"model":"m","max_tokens":512,"messages":[{"role":"user","content":"x"}],
+			"output_config":{"effort":"low","format":{"type":"json_schema","schema":{"type":"object"}}}}`)
+		tr := NewAnthropicToGCPVertexAITranslator(testGemini3Flash)
+		_, body, err := tr.RequestBody(raw, parseAnthropicRequest(t, string(raw)), false)
+		require.NoError(t, err)
+		var gcpReq gcp.GenerateContentRequest
+		require.NoError(t, json.Unmarshal(body, &gcpReq))
+		require.Equal(t, &genai.ThinkingConfig{ThinkingLevel: genai.ThinkingLevelLow}, gcpReq.GenerationConfig.ThinkingConfig)
+		require.Equal(t, map[string]any{"type": "object"}, gcpReq.GenerationConfig.ResponseJsonSchema)
+	})
+
+	t.Run("no format leaves the response MIME type unset", func(t *testing.T) {
+		raw := []byte(`{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"x"}],"output_config":{"effort":"low"}}`)
+		tr := NewAnthropicToGCPVertexAITranslator(testGemini3Flash)
+		_, body, err := tr.RequestBody(raw, parseAnthropicRequest(t, string(raw)), false)
+		require.NoError(t, err)
+		require.NotContains(t, string(body), "responseMimeType")
+	})
+
+	t.Run("unknown format type is rejected", func(t *testing.T) {
+		raw := []byte(`{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"x"}],"output_config":{"format":{"type":"xml"}}}`)
+		tr := NewAnthropicToGCPVertexAITranslator(testGemini3Flash)
+		_, _, err := tr.RequestBody(raw, parseAnthropicRequest(t, string(raw)), false)
+		require.ErrorIs(t, err, internalapi.ErrInvalidRequestBody)
+		require.ErrorContains(t, err, `unsupported output_config.format.type "xml"`)
+	})
+
+	t.Run("schema the Gemini schema cannot express is rejected on older models", func(t *testing.T) {
+		raw := []byte(`{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"x"}],
+			"output_config":{"format":{"type":"json_schema","schema":{"type":"object","$ref":"#/$defs/missing"}}}}`)
+		tr := NewAnthropicToGCPVertexAITranslator("gemini-2.0-flash")
+		_, _, err := tr.RequestBody(raw, parseAnthropicRequest(t, string(raw)), false)
+		require.ErrorIs(t, err, internalapi.ErrInvalidRequestBody)
+		require.ErrorContains(t, err, "invalid output_config.format.schema")
 	})
 }
 
@@ -788,7 +1103,7 @@ func TestAnthropicToGeminiRequest_SystemToolsAndConfig(t *testing.T) {
 			`[{"type":"web_search_20250305","name":"web_search"},{"type":"bash_20250124","name":"bash"}]`,
 		} {
 			_, err := anthropicToGeminiRequest(parseAnthropicRequest(t, `{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"x"}],
-				"tools":`+tools+`,"tool_choice":{"type":"any"}}`), testGemini3Flash, "", nil)
+				"tools":`+tools+`,"tool_choice":{"type":"any"}}`), testGemini3Flash, anthropicOutputConfig{}, nil)
 			require.ErrorIs(t, err, internalapi.ErrInvalidRequestBody)
 			require.ErrorContains(t, err, "server tools such as web_search are not supported for GCPVertexAI backends")
 			require.ErrorContains(t, err, "web_search_20250305")
@@ -801,7 +1116,7 @@ func TestAnthropicToGeminiRequest_SystemToolsAndConfig(t *testing.T) {
 		req, err := anthropicToGeminiRequest(parseAnthropicRequest(t, `{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"x"}],
 			"tools":[{"name":"Read","input_schema":{}},{"type":"text_editor_20250728","name":"str_replace_based_edit_tool"},{"type":"computer_20250124","name":"computer"},
 				{"type":"text_editor_20250124","name":"str_replace_editor"},{"type":"text_editor_20250429","name":"str_replace_based_edit_tool"}]}`),
-			testGemini3Flash, "", logger)
+			testGemini3Flash, anthropicOutputConfig{}, logger)
 		require.NoError(t, err)
 		require.Len(t, req.Tools, 1)
 		require.Contains(t, logs.String(), "skipping Anthropic built-in tools")
@@ -811,7 +1126,7 @@ func TestAnthropicToGeminiRequest_SystemToolsAndConfig(t *testing.T) {
 
 		// A nil logger is allowed.
 		_, err = anthropicToGeminiRequest(parseAnthropicRequest(t, `{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"x"}],
-			"tools":[{"name":"Read"},{"type":"bash_20250124","name":"bash"}]}`), testGemini3Flash, "", nil)
+			"tools":[{"name":"Read"},{"type":"bash_20250124","name":"bash"}]}`), testGemini3Flash, anthropicOutputConfig{}, nil)
 		require.NoError(t, err)
 	})
 
