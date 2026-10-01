@@ -412,8 +412,10 @@ func (MessagesEndpointSpec) GetTranslator(schema filterapi.VersionedAPISchema, m
 		return translator.NewAnthropicToChatCompletionOpenAITranslator(schema.OpenAIPrefix(), modelNameOverride), nil
 	case filterapi.APISchemaAWSBedrock:
 		return translator.NewAnthropicToAWSBedrockTranslator(modelNameOverride), nil
+	case filterapi.APISchemaGCPVertexAI:
+		return translator.NewAnthropicToGCPVertexAITranslator(modelNameOverride), nil
 	default:
-		return nil, fmt.Errorf("/v1/messages endpoint only supports backends that return native Anthropic format (Anthropic, GCPAnthropic, AWSAnthropic). OpenAI and AWSBedrock translation is also supported. Backend %s uses different model format", schema.Name)
+		return nil, fmt.Errorf("/v1/messages endpoint only supports backends that return native Anthropic format (Anthropic, GCPAnthropic, AWSAnthropic). OpenAI, AWSBedrock and GCPVertexAI translation is also supported. Backend %s uses different model format", schema.Name)
 	}
 }
 
